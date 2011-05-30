@@ -17,6 +17,238 @@ VALUE ruby_dln_librefs;
 #define IS_DLEXT(e) (strcmp((e), DLEXT) == 0)
 #endif
 
+static int rb_feature_exists(VALUE);
+
+static VALUE rb_locate_file(VALUE);
+static VALUE rb_locate_file_relative(VALUE);
+static VALUE rb_locate_file_absolute(VALUE);
+static VALUE rb_locate_file_in_load_path(VALUE);
+static VALUE rb_locate_rb_file_in_load_path(VALUE, VALUE, VALUE);
+static VALUE rb_locate_file_with_extension(VALUE, VALUE);
+static VALUE rb_locate_file_with_extensions(VALUE, VALUE);
+static int rb_path_is_absolute(VALUE);
+static int rb_path_is_relative(VALUE);
+static VALUE rb_file_extension(VALUE);
+
+VALUE rb_get_expanded_load_path();
+
+const char *available_extensions[] = {
+    ".rb",
+    DLEXT,
+#ifdef DLEXT2
+    DLEXT2,
+#endif
+    ""
+};
+
+#ifdef DLEXT2
+VALUE available_ext_rb_str[4];
+#else
+VALUE available_ext_rb_str[3];
+#endif
+
+const char *alternate_dl_extensions[] = {
+    DLEXT,
+#ifdef DLEXT2
+    DLEXT2
+#endif
+};
+
+#define CHAR_ARRAY_LEN(array)  (sizeof(array) / sizeof(char*))
+#define VALUE_ARRAY_LEN(array) (sizeof(array) / sizeof(VALUE))
+
+static VALUE
+rb_locate_file(VALUE filename)
+{
+	VALUE full_path = Qnil;
+
+	if (rb_path_is_relative(filename)) {
+		full_path = rb_locate_file_relative(filename);
+	} else if (rb_path_is_absolute(filename)) {
+		full_path = rb_locate_file_absolute(filename);
+	} else {
+		full_path = rb_locate_file_in_load_path(filename);
+	}
+
+	return full_path;
+}
+
+static int
+rb_path_is_relative(VALUE path)
+{
+	const char * path_ptr = RSTRING_PTR(path);
+	const char * current_directory = "./";
+	const char * parent_directory  = "../";
+
+	return (
+	    strncmp(current_directory, path_ptr, 2) == 0 ||
+	    strncmp(parent_directory,  path_ptr, 3) == 0
+	);
+}
+
+static VALUE
+rb_locate_file_relative(VALUE fname)
+{
+	VALUE path = rb_file_expand_path(fname, Qnil);
+	return rb_locate_file_with_extensions(path, rb_file_extension(path));
+}
+
+static int
+rb_path_is_absolute(VALUE path)
+{
+	// Delegate to file.c
+	return rb_is_absolute_path(RSTRING_PTR(path));
+}
+
+static VALUE
+rb_locate_file_absolute(VALUE fname)
+{
+	return rb_locate_file_with_extensions(fname, rb_file_extension(fname));
+}
+
+static VALUE
+rb_locate_file_in_load_path(VALUE path)
+{
+	long i;
+	VALUE load_path          = rb_get_expanded_load_path();
+	VALUE expanded_file_name = Qnil;
+	VALUE base_file_name     = Qnil;
+	VALUE sep                = rb_str_new2("/");
+	VALUE base_extension     = rb_file_extension(path);
+
+	if (RSTRING_LEN(base_extension) == 0) {
+		/* Do an initial loop through the load path only looking for .rb files.
+		 * This is the most common case, so optimize for it. If not found, fall
+		 * back so searching all extensions.
+		 */
+		expanded_file_name = rb_locate_rb_file_in_load_path(path, load_path, sep);
+
+		if (expanded_file_name != Qnil) {
+			return expanded_file_name;
+		}
+	}
+
+	for (i = 0; i < RARRAY_LEN(load_path); ++i) {
+		VALUE directory = RARRAY_PTR(load_path)[i];
+
+		base_file_name = rb_str_plus(directory, sep);
+		base_file_name = rb_str_concat(base_file_name, path);
+
+		/* The .rb extension will be checked again in this call, which is redundant
+		 * since it was checked in the loop above. This hasn't been optimized to
+		 * keep the code cleaner.
+		 */
+		expanded_file_name = rb_locate_file_with_extensions(base_file_name, base_extension);
+
+		if (expanded_file_name != Qnil) {
+			return expanded_file_name;
+		}
+	}
+	return Qnil;
+}
+
+/* This function is only used as an optimization in rb_locate_file_in_load_path */
+static VALUE
+rb_locate_rb_file_in_load_path(VALUE path, VALUE load_path, VALUE sep)
+{
+	long i;
+	VALUE base_file_name;
+	VALUE expanded_file_name;
+	VALUE rb_ext = rb_str_new2(".rb");
+
+	for (i = 0; i < RARRAY_LEN(load_path); ++i) {
+		VALUE directory = RARRAY_PTR(load_path)[i];
+
+		base_file_name = rb_str_plus(directory, sep);
+		base_file_name = rb_str_concat(base_file_name, path);
+
+		expanded_file_name = rb_locate_file_with_extension(base_file_name, rb_ext);
+
+		if (expanded_file_name != Qnil) {
+			return expanded_file_name;
+		}
+	}
+	return Qnil;
+}
+
+static VALUE
+rb_locate_file_with_extension(VALUE base_file_name, VALUE extension) {
+	VALUE file_name_with_extension = rb_str_plus(
+	    base_file_name,
+	    extension);
+
+	if (rb_feature_exists(file_name_with_extension)) {
+		return file_name_with_extension;
+	} else {
+		return Qnil;
+	}
+}
+
+static VALUE
+rb_locate_file_with_extensions(VALUE base_file_name, VALUE extension) {
+	unsigned int j;
+	VALUE file_name_with_extension;
+	VALUE directory, basename;
+
+	if (RSTRING_LEN(extension) == 0) {
+		for (j = 0; j < VALUE_ARRAY_LEN(available_ext_rb_str); ++j) {
+			file_name_with_extension = rb_str_plus(
+			    base_file_name,
+			    available_ext_rb_str[j]);
+
+			if (rb_feature_exists(file_name_with_extension)) {
+				return file_name_with_extension;
+			}
+		}
+	} else {
+		if (rb_feature_exists(base_file_name)) {
+			return base_file_name;
+		} else {
+			for (j = 0; j < VALUE_ARRAY_LEN(available_ext_rb_str); ++j) {
+				// Also try loading 'dot.dot.bundle' for 'dot.dot'
+				// Also try loading 'test.1.rb'      for 'test.1'
+				file_name_with_extension = rb_str_plus(
+				    base_file_name,
+				    available_ext_rb_str[j]);
+
+				if (rb_feature_exists(file_name_with_extension)) {
+					return file_name_with_extension;
+				}
+			}
+
+			for (j = 0; j < CHAR_ARRAY_LEN(alternate_dl_extensions); ++j) {
+				// Try loading the native DLEXT version of this platform.
+				// This allows 'pathname.so' to require 'pathname.bundle' on OSX
+				directory = rb_file_dirname(base_file_name);
+				basename  = rb_funcall(rb_cFile, rb_intern("basename"), 2,
+				                base_file_name, extension);
+				basename  = rb_str_cat2(basename, alternate_dl_extensions[j]);
+
+				file_name_with_extension = rb_funcall(rb_cFile, rb_intern("join"), 2,
+				                               directory, basename);
+
+				if (rb_feature_exists(file_name_with_extension)) {
+					return file_name_with_extension;
+				}
+			}
+		}
+	}
+	return Qnil;
+}
+
+static VALUE
+rb_file_extension(VALUE path)
+{
+	return rb_funcall(rb_cFile, rb_intern("extname"), 1, path);
+}
+
+static int
+rb_feature_exists(VALUE expanded_path)
+{
+	return rb_funcall(rb_cFile, rb_intern("file?"), 1, expanded_path) == Qtrue;
+}
+
+
 
 static const char *const loadable_ext[] = {
     ".rb", DLEXT,
@@ -746,6 +978,7 @@ Init_load()
 {
 #undef rb_intern
 #define rb_intern(str) rb_intern2((str), strlen(str))
+	unsigned int j;
     rb_vm_t *vm = GET_VM();
     static const char var_load_path[] = "$:";
     ID id_load_path = rb_intern2(var_load_path, sizeof(var_load_path)-1);
@@ -769,4 +1002,9 @@ Init_load()
 
     ruby_dln_librefs = rb_ary_new();
     rb_gc_register_mark_object(ruby_dln_librefs);
+
+	for (j = 0; j < CHAR_ARRAY_LEN(available_extensions); ++j) {
+		available_ext_rb_str[j] = rb_str_new2(available_extensions[j]);
+		rb_gc_register_mark_object(available_ext_rb_str[j]);
+	}
 }
