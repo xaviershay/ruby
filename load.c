@@ -159,7 +159,7 @@ rb_locate_file_relative(VALUE fname)
 static int
 rb_path_is_absolute(VALUE path)
 {
-	// Delegate to file.c
+	/* Delegate to file.c */
 	return rb_is_absolute_path(RSTRING_PTR(path));
 }
 
@@ -268,8 +268,9 @@ rb_locate_file_with_extensions(VALUE base_file_name, VALUE extension) {
 			return base_file_name;
 		} else {
 			for (j = 0; j < VALUE_ARRAY_LEN(available_ext_rb_str); ++j) {
-				// Also try loading 'dot.dot.bundle' for 'dot.dot'
-				// Also try loading 'test.1.rb'      for 'test.1'
+				/* Also try loading 'dot.dot.bundle' for 'dot.dot'
+				 * Also try loading 'test.1.rb'      for 'test.1'
+				 */
 				file_name_with_extension = rb_str_plus(
 				    base_file_name,
 				    available_ext_rb_str[j]);
@@ -280,8 +281,9 @@ rb_locate_file_with_extensions(VALUE base_file_name, VALUE extension) {
 			}
 
 			for (j = 0; j < CHAR_ARRAY_LEN(alternate_dl_extensions); ++j) {
-				// Try loading the native DLEXT version of this platform.
-				// This allows 'pathname.so' to require 'pathname.bundle' on OSX
+				/* Try loading the native DLEXT version of this platform.
+				 * This allows 'pathname.so' to require 'pathname.bundle' on OSX
+				 */
 				directory = rb_file_dirname(base_file_name);
 				basename  = rb_funcall(rb_cFile, rb_intern("basename"), 2,
 				                base_file_name, extension);
@@ -1038,7 +1040,7 @@ rb_require_safe(VALUE fname, int safe)
 		if (path == Qnil) {
 			load_failed(fname);
 		} else {
-			if (ftptr = load_lock(RSTRING_PTR(path))) { // Allows circular requires to work
+			if (ftptr = load_lock(RSTRING_PTR(path))) { /* Allows circular requires to work */
 				if (!rb_file_has_been_required(path)) {
 					if (rb_file_is_ruby(path)) {
 						rb_load_internal(path, 0);
