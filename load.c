@@ -17,6 +17,7 @@ VALUE ruby_dln_librefs;
 #define IS_DLEXT(e) (strcmp((e), DLEXT) == 0)
 #endif
 
+static VALUE get_loaded_features();
 static int rb_feature_exists(VALUE);
 
 static VALUE rb_locate_file(VALUE);
@@ -31,6 +32,14 @@ static int rb_path_is_relative(VALUE);
 static VALUE rb_file_extension(VALUE);
 
 VALUE rb_get_expanded_load_path();
+
+static VALUE rb_cLoadedFeaturesProxy;
+static void rb_rehash_loaded_features();
+static VALUE rb_loaded_features_hook(int, VALUE*, VALUE);
+static void define_loaded_features_proxy();
+static VALUE loaded_features_proxy_new(VALUE);
+
+static st_table * get_loaded_features_hash(void);
 
 const char *available_extensions[] = {
     ".rb",
@@ -249,6 +258,90 @@ rb_feature_exists(VALUE expanded_path)
 }
 
 
+/*
+ * $LOADED_FEATURES is exposed publically as an array, but under the covers
+ * we also store this data in a hash for fast lookups. So that we can rebuild
+ * the hash whenever $LOADED_FEATURES is changed, we wrap the Array class
+ * in a proxy that intercepts all data-modifying methods and rebuilds the
+ * hash.
+ *
+ * Note that the list of intercepted methods is currently non-comprehensive
+ * --- it only covers modifications made by the ruby and rubyspec test suites.
+ */
+static void
+define_loaded_features_proxy()
+{
+	const char* methods_to_hook[] = {"<<", "push", "clear", "replace", "delete"};
+	unsigned int i;
+
+	rb_cLoadedFeaturesProxy = rb_define_class("LoadedFeaturesProxy", rb_cArray);
+	for (i = 0; i < CHAR_ARRAY_LEN(methods_to_hook); ++i) {
+		rb_define_method(
+		    rb_cLoadedFeaturesProxy,
+		    methods_to_hook[i],
+		    rb_loaded_features_hook,
+		    -1);
+	}
+}
+
+static VALUE
+rb_loaded_features_hook(int argc, VALUE *argv, VALUE self)
+{
+	VALUE ret;
+	ret = rb_call_super(argc, argv);
+	rb_rehash_loaded_features();
+	return ret;
+}
+
+static void
+rb_rehash_loaded_features()
+{
+	int i;
+	VALUE features;
+	VALUE feature;
+
+	st_table* loaded_features_hash = get_loaded_features_hash();
+
+	st_clear(loaded_features_hash);
+
+	features = get_loaded_features();
+
+	for (i = 0; i < RARRAY_LEN(features); ++i) {
+		feature = RARRAY_PTR(features)[i];
+		st_insert(
+		    loaded_features_hash,
+		    (st_data_t)ruby_strdup(RSTRING_PTR(feature)),
+		    (st_data_t)rb_barrier_new());
+	}
+}
+
+static st_table *
+get_loaded_features_hash(void)
+{
+	st_table* loaded_features_hash;
+	loaded_features_hash = GET_VM()->loaded_features_hash;
+
+	if (!loaded_features_hash) {
+		GET_VM()->loaded_features_hash = loaded_features_hash = st_init_strcasetable();
+	}
+
+	return loaded_features_hash;
+}
+
+/* This is cargo-culted from ary_alloc in array.c. I am sure there is 
+ * a much better way to instantiate this class, I just don't know what it is.
+ */
+static VALUE
+loaded_features_proxy_new(VALUE klass)
+{
+    NEWOBJ(ary, struct RArray);
+    OBJSETUP(ary, klass, T_ARRAY);
+    FL_SET((ary), RARRAY_EMBED_FLAG);
+    RBASIC(ary)->flags &= ~RARRAY_EMBED_LEN_MASK;
+    RBASIC(ary)->flags |= (0) << RARRAY_EMBED_LEN_SHIFT;
+
+    return (VALUE)ary;
+}
 
 static const char *const loadable_ext[] = {
     ".rb", DLEXT,
@@ -990,7 +1083,10 @@ Init_load()
 
     rb_define_virtual_variable("$\"", get_loaded_features, 0);
     rb_define_virtual_variable("$LOADED_FEATURES", get_loaded_features, 0);
-    vm->loaded_features = rb_ary_new();
+
+	define_loaded_features_proxy();
+
+	vm->loaded_features = loaded_features_proxy_new(rb_cLoadedFeaturesProxy);
 
     rb_define_global_function("load", rb_f_load, -1);
     rb_define_global_function("require", rb_f_require, 1);
