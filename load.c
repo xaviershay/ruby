@@ -17,8 +17,20 @@ VALUE ruby_dln_librefs;
 #define IS_DLEXT(e) (strcmp((e), DLEXT) == 0)
 #endif
 
+VALUE rb_f_require(VALUE, VALUE);
+VALUE rb_f_require_relative(VALUE, VALUE);
+static VALUE rb_f_load(int, VALUE *);
+VALUE rb_require_safe(VALUE, int);
+
 static VALUE get_loaded_features();
 static int rb_feature_exists(VALUE);
+
+static int rb_file_is_ruby(VALUE path);
+static int rb_file_has_been_required(VALUE);
+static int rb_file_is_being_required(VALUE);
+
+void rb_provide(const char *feature);
+static void rb_provide_feature(VALUE);
 
 static VALUE rb_locate_file(VALUE);
 static VALUE rb_locate_file_relative(VALUE);
@@ -39,6 +51,7 @@ static VALUE rb_loaded_features_hook(int, VALUE*, VALUE);
 static void define_loaded_features_proxy();
 static VALUE loaded_features_proxy_new(VALUE);
 
+static st_table * get_loading_table(void);
 static st_table * get_loaded_features_hash(void);
 
 const char *available_extensions[] = {
@@ -65,6 +78,34 @@ const char *alternate_dl_extensions[] = {
 
 #define CHAR_ARRAY_LEN(array)  (sizeof(array) / sizeof(char*))
 #define VALUE_ARRAY_LEN(array) (sizeof(array) / sizeof(VALUE))
+
+static int
+rb_file_is_ruby(VALUE path)
+{
+	const char * ext;
+	ext = ruby_find_extname(RSTRING_PTR(path), 0);
+
+	return ext && IS_RBEXT(ext);
+}
+
+static int
+rb_file_has_been_required(VALUE expanded_path)
+{
+	st_data_t data;
+	st_data_t path_key = (st_data_t)RSTRING_PTR(expanded_path);
+	st_table *loaded_features_hash = get_loaded_features_hash();
+
+	return st_lookup(loaded_features_hash, path_key, &data);
+}
+
+static int
+rb_file_is_being_required(VALUE full_path) {
+	const char *ftptr = RSTRING_PTR(full_path);
+	st_data_t data;
+	st_table *loading_tbl = get_loading_table();
+
+	return (loading_tbl && st_lookup(loading_tbl, (st_data_t)ftptr, &data));
+}
 
 static VALUE
 rb_locate_file(VALUE filename)
@@ -538,40 +579,51 @@ rb_provided(const char *feature)
     return rb_feature_provided(feature, 0);
 }
 
+/* Should return true if the file has or is being loaded, but should 
+ * not actually load the file.
+ */
+int
+rb_feature_provided_2(VALUE fname)
+{
+	VALUE full_path = rb_locate_file(fname);
+
+	if (
+	    full_path != Qnil && 
+	    (
+	        rb_file_has_been_required(full_path) || 
+	        rb_file_is_being_required(full_path)
+	    )
+	) {
+		return TRUE;
+	} else {
+		return FALSE;
+	}
+}
+
 int
 rb_feature_provided(const char *feature, const char **loading)
 {
-    const char *ext = strrchr(feature, '.');
-    volatile VALUE fullpath = 0;
-
-    if (*feature == '.' &&
-	(feature[1] == '/' || strncmp(feature+1, "./", 2) == 0)) {
-	fullpath = rb_file_expand_path(rb_str_new2(feature), Qnil);
-	feature = RSTRING_PTR(fullpath);
-    }
-    if (ext && !strchr(ext, '/')) {
-	if (IS_RBEXT(ext)) {
-	    if (rb_feature_p(feature, ext, TRUE, FALSE, loading)) return TRUE;
-	    return FALSE;
-	}
-	else if (IS_SOEXT(ext) || IS_DLEXT(ext)) {
-	    if (rb_feature_p(feature, ext, FALSE, FALSE, loading)) return TRUE;
-	    return FALSE;
-	}
-    }
-    if (rb_feature_p(feature, 0, TRUE, FALSE, loading))
-	return TRUE;
-    return FALSE;
+	VALUE fname = rb_str_new2(feature);
+	return rb_feature_provided_2(fname);
 }
 
 static void
 rb_provide_feature(VALUE feature)
 {
+	st_table* loaded_features_hash;
+
     if (OBJ_FROZEN(get_loaded_features())) {
 	rb_raise(rb_eRuntimeError,
 		 "$LOADED_FEATURES is frozen; cannot append feature");
     }
     rb_ary_push(get_loaded_features(), feature);
+
+	loaded_features_hash = get_loaded_features_hash();
+	st_insert(
+	    loaded_features_hash,
+	    (st_data_t)ruby_strdup(RSTRING_PTR(feature)),
+	    (st_data_t)rb_barrier_new()
+	);
 }
 
 void
@@ -892,9 +944,14 @@ load_ext(VALUE path)
     return (VALUE)dln_load(RSTRING_PTR(path));
 }
 
+/* 
+ * returns the path loaded, or false if the file was already loaded. Raises
+ * LoadError if a file cannot be found. 
+ */
 VALUE
 rb_require_safe(VALUE fname, int safe)
 {
+	VALUE path = Qnil;
     volatile VALUE result = Qnil;
     rb_thread_t *th = GET_THREAD();
     volatile VALUE errinfo = th->errinfo;
@@ -907,34 +964,41 @@ rb_require_safe(VALUE fname, int safe)
     PUSH_TAG();
     saved.safe = rb_safe_level();
     if ((state = EXEC_TAG()) == 0) {
-	VALUE path;
 	long handle;
 	int found;
 
 	rb_set_safe_level_force(safe);
 	FilePathValue(fname);
 	rb_set_safe_level_force(0);
-	found = search_required(fname, &path, safe);
-	if (found) {
-	    if (!path || !(ftptr = load_lock(RSTRING_PTR(path)))) {
-		result = Qfalse;
-	    }
-	    else {
-		switch (found) {
-		  case 'r':
-		    rb_load_internal(path, 0);
-		    break;
+		path = rb_locate_file(fname);
 
-		  case 's':
-		    handle = (long)rb_vm_call_cfunc(rb_vm_top_self(), load_ext,
-						    path, 0, path);
-		    rb_ary_push(ruby_dln_librefs, LONG2NUM(handle));
-		    break;
+		if (safe >= 1 && OBJ_TAINTED(path)) {
+			rb_raise(rb_eSecurityError, "Loading from unsafe file %s", RSTRING_PTR(path));
 		}
-		rb_provide_feature(path);
-		result = Qtrue;
-	    }
-	}
+
+		result = Qfalse;
+		if (path == Qnil) {
+			load_failed(fname);
+		} else {
+			if (ftptr = load_lock(RSTRING_PTR(path))) { // Allows circular requires to work
+				if (!rb_file_has_been_required(path)) {
+					if (rb_file_is_ruby(path)) {
+						rb_load_internal(path, 0);
+					} else {
+						handle = (long)rb_vm_call_cfunc(
+						    rb_vm_top_self(),
+						    load_ext,
+						    path,
+						    0,
+						    path
+						);
+						rb_ary_push(ruby_dln_librefs, LONG2NUM(handle));
+					}
+					rb_provide_feature(path);
+					result = Qtrue;
+				}
+			}
+		}
     }
     POP_TAG();
     load_unlock(ftptr, !state);
@@ -950,7 +1014,11 @@ rb_require_safe(VALUE fname, int safe)
 
     th->errinfo = errinfo;
 
-    return result;
+	if (result == Qtrue) {
+		return path;
+	} else {
+		return Qfalse;
+	}
 }
 
 VALUE
